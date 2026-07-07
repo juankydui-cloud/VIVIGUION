@@ -237,6 +237,28 @@ async function callGemini(key, model, payload) {
   return { text: text || '(sin respuesta)', raw: json };
 }
 
+/* Traduce la consulta clínica (en español) a una búsqueda en INGLÉS para los
+   repositorios médicos, que son mayoritariamente en inglés. Si falla, usa la
+   consulta original. */
+async function optimizeQuery(question, key) {
+  if (!key) return question;
+  try {
+    const { text } = await callGemini(key, GEMINI_MODEL, {
+      systemInstruction: { parts: [{ text:
+        'Convierte la consulta clínica del usuario en una búsqueda para PubMed en INGLÉS. '
+        + 'Devuelve SOLO de 3 a 7 palabras clave en inglés separadas por espacios, sin comillas, '
+        + 'sin puntuación y sin ninguna explicación. Añade la palabra "nursing" solo si la consulta '
+        + 'trata de cuidados de enfermería.' }] },
+      contents: [{ role: 'user', parts: [{ text: question }] }],
+      generationConfig: { temperature: 0.1, maxOutputTokens: 40 }
+    });
+    const q = (text || '').replace(/["'\n]/g, ' ').replace(/\s+/g, ' ').trim();
+    return q.length >= 3 ? q : question;
+  } catch (e) {
+    return question;
+  }
+}
+
 /* ======================================================================
    3) RUTAS
    ====================================================================== */
@@ -318,8 +340,8 @@ const routes = {
     const wantSbart = body.sbart !== false; // por defecto, formato SBART
     const limit = Math.min(Math.max(parseInt(body.limit, 10) || 4, 1), 8);
 
-    // 1) Buscar evidencia en repositorios
-    const searchTerm = body.searchTerm || question;
+    // 1) Buscar evidencia en repositorios (traduciendo antes a inglés)
+    const searchTerm = body.searchTerm || await optimizeQuery(question, key);
     const sources = await searchLiterature(searchTerm, limit);
 
     // 2) Construir el bloque de evidencia numerado
