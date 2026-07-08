@@ -1,4 +1,4 @@
-/* =========================================================================
+https://github.com/juankydui-cloud/VIVIGUION* =========================================================================
    VIVI · Backend clínico para la Guía HJ23 / iNurse
    -------------------------------------------------------------------------
    - Proxy hacia Gemini (para no exponer la API key en el móvil)
