@@ -1,10 +1,11 @@
-https://github.com/juankydui-cloud/VIVIGUION* =========================================================================
+/* =========================================================================
    VIVI · Backend clínico para la Guía HJ23 / iNurse
    -------------------------------------------------------------------------
    - Proxy hacia Gemini (para no exponer la API key en el móvil)
    - Búsqueda en repositorios médicos reales: Europe PMC, PubMed, openFDA
    - Endpoint de "respuesta con evidencia": busca en Internet + sintetiza
      con Gemini en el estilo de Vivi (voz, SBART, sin markdown)
+   - Control de luces Philips Hue (bridge local, API CLIP v2)
 
    Sin dependencias externas. Requiere Node 18 o superior (fetch nativo).
    Ejecutar:   node server.js
@@ -13,6 +14,7 @@ https://github.com/juankydui-cloud/VIVIGUION* ==================================
 'use strict';
 
 const http = require('node:http');
+const https = require('node:https');
 
 /* --------------------------- Configuración --------------------------- */
 const PORT          = process.env.PORT || 8080;
@@ -27,6 +29,16 @@ const NCBI_TOOL     = 'vivi-hj23';
 const NCBI_EMAIL    = process.env.NCBI_EMAIL || '';
 
 const GEMINI_BASE   = 'https://generativelanguage.googleapis.com/v1beta/models';
+
+// --- Philips Hue (bridge local, API CLIP v2) ---
+// IP del bridge en tu red (la da https://discovery.meethue.com o la app Hue).
+const HUE_BRIDGE_IP = process.env.HUE_BRIDGE_IP || '';
+// Clave de aplicación: se consigue una sola vez con POST /api/hue/pair
+// (pulsando antes el botón del bridge) y se guarda aquí.
+const HUE_APP_KEY   = process.env.HUE_APP_KEY || '';
+// Opcional pero recomendado si expones el servidor a Internet: un secreto
+// compartido. Si está puesto, las rutas /api/hue/* exigen este token.
+const HUE_TOKEN     = process.env.HUE_TOKEN || '';
 
 /* ------------------------------ Utilidades ------------------------------ */
 
@@ -266,7 +278,135 @@ async function optimizeQuery(question, key) {
 }
 
 /* ======================================================================
-   3) RUTAS
+   3) PHILIPS HUE (bridge local, API CLIP v2)
+   ====================================================================== */
+
+/* El bridge usa HTTPS con certificado autofirmado, así que hablamos con él
+   mediante node:https aceptando ese certificado. Solo se usa para la IP
+   local del bridge; el resto de peticiones del servidor siguen verificando
+   los certificados con normalidad. */
+function hueRequest(method, path, payload, appKey) {
+  return new Promise((resolve, reject) => {
+    if (!HUE_BRIDGE_IP) {
+      return reject(httpErr(400, 'Falta HUE_BRIDGE_IP en el servidor (la IP del bridge en tu red).'));
+    }
+    const body = payload ? JSON.stringify(payload) : null;
+    const headers = { 'Content-Type': 'application/json' };
+    if (appKey) headers['hue-application-key'] = appKey;
+    const req = https.request({
+      host: HUE_BRIDGE_IP,
+      method,
+      path,
+      headers,
+      rejectUnauthorized: false, // certificado autofirmado del bridge
+      timeout: 10000
+    }, res => {
+      let data = '';
+      res.on('data', c => { data += c; });
+      res.on('end', () => {
+        let json = null;
+        try { json = data ? JSON.parse(data) : null; } catch (_) { json = null; }
+        resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode, json });
+      });
+    });
+    req.on('timeout', () => req.destroy(new Error('El bridge Hue no responde (¿está el servidor en la misma red?)')));
+    req.on('error', reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+function requireHueKey() {
+  if (!HUE_APP_KEY) {
+    throw httpErr(400, 'Falta HUE_APP_KEY en el servidor. Pulsa el botón del bridge y llama a POST /api/hue/pair para conseguirla.');
+  }
+  return HUE_APP_KEY;
+}
+
+function checkHueToken(body, req) {
+  if (!HUE_TOKEN) return;
+  const auth = req.headers['authorization'] || '';
+  const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+  if ((body.token || bearer) !== HUE_TOKEN) {
+    throw httpErr(401, 'Token de Hue no válido.');
+  }
+}
+
+/* Colores: aceptamos "#rrggbb" o nombres sencillos en español y los
+   convertimos al espacio xy que usa Hue (conversión sRGB → CIE 1931). */
+const HUE_COLORS = {
+  rojo: '#ff0000', verde: '#00ff00', azul: '#0000ff', amarillo: '#ffdf00',
+  naranja: '#ff7f00', rosa: '#ff69b4', morado: '#8000ff', violeta: '#8000ff',
+  cian: '#00ffff', turquesa: '#40e0d0', blanco: '#ffffff',
+  'blanco calido': '#ffd9a0', 'blanco cálido': '#ffd9a0', 'blanco frio': '#e6f0ff', 'blanco frío': '#e6f0ff'
+};
+
+function colorToXY(color) {
+  let hex = String(color || '').trim().toLowerCase();
+  if (HUE_COLORS[hex]) hex = HUE_COLORS[hex];
+  const m = /^#?([0-9a-f]{6})$/.exec(hex);
+  if (!m) return null;
+  const n = parseInt(m[1], 16);
+  const gam = c => (c > 0.04045 ? Math.pow((c + 0.055) / 1.055, 2.4) : c / 12.92);
+  const r = gam(((n >> 16) & 255) / 255);
+  const g = gam(((n >> 8) & 255) / 255);
+  const b = gam((n & 255) / 255);
+  const X = r * 0.4124 + g * 0.3576 + b * 0.1805;
+  const Y = r * 0.2126 + g * 0.7152 + b * 0.0722;
+  const Z = r * 0.0193 + g * 0.1192 + b * 0.9505;
+  const sum = X + Y + Z;
+  if (!sum) return { x: 0.3127, y: 0.329 }; // negro → punto blanco neutro
+  return { x: +(X / sum).toFixed(4), y: +(Y / sum).toFixed(4) };
+}
+
+/* Traduce los parámetros sencillos de la app (on, brightness, color) al
+   cuerpo que espera la API v2 del bridge. */
+function hueStateFromParams(body) {
+  const out = {};
+  if (typeof body.on === 'boolean') out.on = { on: body.on };
+  const bri = parseFloat(body.brightness);
+  if (!isNaN(bri)) {
+    out.dimming = { brightness: Math.min(Math.max(bri, 0), 100) };
+    if (!out.on && bri > 0) out.on = { on: true }; // subir brillo implica encender
+  }
+  if (body.color) {
+    const xy = colorToXY(body.color);
+    if (!xy) throw httpErr(400, 'Color no reconocido. Usa "#rrggbb" o un nombre como rojo, azul, blanco cálido…');
+    out.color = { xy };
+    if (!out.on) out.on = { on: true }; // cambiar color implica encender
+  }
+  if (!Object.keys(out).length) {
+    throw httpErr(400, 'No hay nada que cambiar: manda "on" (true/false), "brightness" (0-100) y/o "color".');
+  }
+  return out;
+}
+
+async function hueListLights() {
+  const key = requireHueKey();
+  const { ok, status, json } = await hueRequest('GET', '/clip/v2/resource/light', null, key);
+  if (!ok) throw httpErr(502, 'Error del bridge Hue (HTTP ' + status + ').');
+  const rows = (json && json.data) || [];
+  return rows.map(l => ({
+    id: l.id,
+    name: (l.metadata && l.metadata.name) || '(sin nombre)',
+    on: !!(l.on && l.on.on),
+    brightness: l.dimming ? l.dimming.brightness : null
+  }));
+}
+
+/* Grupo "toda la casa" del bridge, para encender/apagar todo de una vez. */
+async function hueBridgeHomeGroup() {
+  const key = requireHueKey();
+  const { ok, status, json } = await hueRequest('GET', '/clip/v2/resource/grouped_light', null, key);
+  if (!ok) throw httpErr(502, 'Error del bridge Hue (HTTP ' + status + ').');
+  const rows = (json && json.data) || [];
+  const home = rows.find(g => g.owner && g.owner.rtype === 'bridge_home') || rows[0];
+  if (!home) throw httpErr(404, 'El bridge no tiene grupos de luces.');
+  return home.id;
+}
+
+/* ======================================================================
+   4) RUTAS
    ====================================================================== */
 
 const routes = {
@@ -278,6 +418,11 @@ const routes = {
     model: GEMINI_MODEL,
     gemini_key_server: !!GEMINI_KEY,
     repos: ['Europe PMC', 'PubMed', 'openFDA'],
+    hue: {
+      bridge_ip: !!HUE_BRIDGE_IP,
+      app_key: !!HUE_APP_KEY,
+      token: !!HUE_TOKEN
+    },
     time: new Date().toISOString()
   }),
 
@@ -403,6 +548,69 @@ const routes = {
       answer: text,
       sources: sources.map((s, i) => ({ n: i + 1, ...s }))
     };
+  },
+
+  /* ======================= PHILIPS HUE ======================= */
+
+  /* --- emparejar con el bridge (una sola vez) ---
+     1. Pulsa el botón redondo del bridge.
+     2. Antes de 30 segundos: POST /api/hue/pair
+     3. Guarda la clave devuelta en la variable de entorno HUE_APP_KEY. */
+  'POST /api/hue/pair': async (body, req) => {
+    checkHueToken(body, req);
+    const { json } = await hueRequest('POST', '/api', {
+      devicetype: 'vivi#backend',
+      generateclientkey: true
+    });
+    const first = Array.isArray(json) ? json[0] : null;
+    if (first && first.success && first.success.username) {
+      return {
+        ok: true,
+        app_key: first.success.username,
+        client_key: first.success.clientkey || null,
+        siguiente_paso: 'Guarda app_key en la variable de entorno HUE_APP_KEY y reinicia el servidor.'
+      };
+    }
+    const desc = (first && first.error && first.error.description) || 'respuesta inesperada del bridge';
+    throw httpErr(400, 'No se pudo emparejar: ' + desc + '. ¿Has pulsado el botón del bridge?');
+  },
+
+  /* --- listar luces --- */
+  'GET /api/hue/lights': async (body, req) => {
+    checkHueToken(body, req);
+    const lights = await hueListLights();
+    return { count: lights.length, lights };
+  },
+
+  /* --- controlar una luz o todas ---
+     body: { id?, on?, brightness?, color?, token? }
+     - Sin "id" (o con id "all"/"todas") actúa sobre todas las luces.
+     - "id" también puede ser el nombre de la luz tal y como sale en
+       /api/hue/lights (sin distinguir mayúsculas). */
+  'POST /api/hue/light': async (body, req) => {
+    checkHueToken(body, req);
+    const state = hueStateFromParams(body);
+    const key = requireHueKey();
+    let id = String(body.id || '').trim();
+
+    if (!id || /^(all|todas|todo)$/i.test(id)) {
+      const groupId = await hueBridgeHomeGroup();
+      const { ok, status } = await hueRequest('PUT', '/clip/v2/resource/grouped_light/' + groupId, state, key);
+      if (!ok) throw httpErr(502, 'Error del bridge Hue (HTTP ' + status + ').');
+      return { ok: true, target: 'todas las luces', applied: state };
+    }
+
+    // Si no parece un UUID, lo tratamos como nombre de luz.
+    if (!/^[0-9a-f-]{36}$/i.test(id)) {
+      const lights = await hueListLights();
+      const found = lights.find(l => l.name.toLowerCase() === id.toLowerCase())
+        || lights.find(l => l.name.toLowerCase().includes(id.toLowerCase()));
+      if (!found) throw httpErr(404, 'No encuentro ninguna luz llamada "' + id + '". Mira /api/hue/lights.');
+      id = found.id;
+    }
+    const { ok, status } = await hueRequest('PUT', '/clip/v2/resource/light/' + id, state, key);
+    if (!ok) throw httpErr(502, 'Error del bridge Hue (HTTP ' + status + ').');
+    return { ok: true, target: id, applied: state };
   }
 };
 
@@ -441,4 +649,7 @@ server.listen(PORT, () => {
   console.log('VIVI backend escuchando en el puerto ' + PORT);
   console.log('  Clave Gemini en servidor: ' + (GEMINI_KEY ? 'sí' : 'no (la aporta el cliente)'));
   console.log('  Modelo: ' + GEMINI_MODEL);
+  console.log('  Philips Hue: ' + (HUE_BRIDGE_IP
+    ? ('bridge ' + HUE_BRIDGE_IP + (HUE_APP_KEY ? ' (emparejado)' : ' (falta emparejar: POST /api/hue/pair)'))
+    : 'sin configurar (pon HUE_BRIDGE_IP para activarlo)'));
 });
