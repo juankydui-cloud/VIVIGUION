@@ -284,7 +284,12 @@ async function optimizeQuery(question, key) {
 /* El bridge usa HTTPS con certificado autofirmado, así que hablamos con él
    mediante node:https aceptando ese certificado. Solo se usa para la IP
    local del bridge; el resto de peticiones del servidor siguen verificando
-   los certificados con normalidad. */
+   los certificados con normalidad.
+   Sin keep-alive: el bridge cierra la conexión tras cada respuesta y, si se
+   intenta reutilizar (comportamiento por defecto de Node 19+), la segunda
+   petición se queda colgada hasta agotar el tiempo de espera. */
+const hueAgent = new https.Agent({ keepAlive: false, rejectUnauthorized: false });
+
 function hueRequest(method, path, payload, appKey) {
   return new Promise((resolve, reject) => {
     if (!HUE_BRIDGE_IP) {
@@ -298,6 +303,7 @@ function hueRequest(method, path, payload, appKey) {
       method,
       path,
       headers,
+      agent: hueAgent,
       rejectUnauthorized: false, // certificado autofirmado del bridge
       timeout: 10000
     }, res => {
