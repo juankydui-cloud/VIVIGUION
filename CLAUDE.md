@@ -10,12 +10,13 @@ Cuando el usuario pida algo sobre sus luces ("enciende las luces", "bájalas al
 veinte", "apágalas", "ponlas en azul", "sube la del salón"…), hazlo
 directamente llamando a su backend, sin pedirle URL ni token:
 
-- **URL**: `https://vivi-luces.loca.lt` (túnel localtunnel con subdominio fijo;
-  el usuario lo arranca con `lt --port 8080 --subdomain vivi-luces`).
+- **URL**: `https://mac-mini-de-juank.tail770e17.ts.net` (Tailscale Funnel en
+  el Mac mini del usuario; dirección fija que sobrevive a reinicios).
 - **Token**: `vivi-luces-8823` (va en el campo `token` del body, o como
   `Authorization: Bearer`).
-- Añade la cabecera `bypass-tunnel-reminder: 1` y un `User-Agent` propio para
-  saltarte la página intersticial de loca.lt.
+- URL antigua de respaldo (solo si el usuario dice que volvió a loca.lt):
+  `https://vivi-luces.loca.lt`, que además necesita las cabeceras
+  `bypass-tunnel-reminder: 1` y un `User-Agent` propio.
 
 Endpoint principal — `POST /api/hue/light`, body JSON:
 
@@ -40,20 +41,21 @@ token) y `GET /api/health` (estado del servidor).
 Ejemplo de llamada completa:
 
 ```bash
-curl -sS -X POST "https://vivi-luces.loca.lt/api/hue/light" \
+curl -sS -X POST "https://mac-mini-de-juank.tail770e17.ts.net/api/hue/light" \
   -H "Content-Type: application/json" \
-  -H "bypass-tunnel-reminder: 1" \
-  -H "User-Agent: vivi-backend-client" \
   -d '{"on": true, "token": "vivi-luces-8823"}'
 ```
 
-Si el túnel no responde o devuelve una respuesta vacía, reintenta una vez
-(el túnel falla de forma puntual) y, si sigue caído, dile al usuario que
-arranque el servidor y el túnel:
+Si no responde, reintenta una vez tras una pausa breve (la primera conexión
+puede tardar mientras Tailscale emite el certificado). Si sigue caído, dile
+al usuario que compruebe en su Mac que el servidor y el Funnel están activos:
 
 ```bash
 HUE_BRIDGE_IP=... HUE_APP_KEY=... HUE_TOKEN=vivi-luces-8823 node server.js
-lt --port 8080 --subdomain vivi-luces
+/Applications/Tailscale.app/Contents/MacOS/Tailscale funnel --bg 8080
 ```
+
+(Idealmente el servidor corre bajo pm2 con el nombre `vivi-servidor`;
+`pm2 status` y `pm2 restart vivi-servidor` son los comandos útiles.)
 
 Responde al usuario en español, en tono natural y apto para leerse en voz alta.
